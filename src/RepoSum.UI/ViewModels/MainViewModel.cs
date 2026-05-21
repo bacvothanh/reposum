@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
@@ -15,6 +16,8 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly IChangeSummaryService _changeSummaryService;
     private readonly IReadStateStore _readStateStore;
     private readonly ILogger<MainViewModel> _logger;
+    private readonly HashSet<string> _removedSelectedRepositoryIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RepoSelectionItemViewModel> _preservedSelectedRepositories = new(StringComparer.OrdinalIgnoreCase);
 
     public MainViewModel(
         ISettingsService settingsService,
@@ -100,13 +103,15 @@ public sealed partial class MainViewModel : ObservableObject
             return;
         }
 
-        var selected = Repositories.Where(r => r.IsSelected).Select(r => r.Id).ToList();
+        var selected = Repositories.Where(r => r.IsSelected).Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        selected.UnionWith(_removedSelectedRepositoryIds);
+        selected.UnionWith(_preservedSelectedRepositories.Values.Where(r => r.IsSelected).Select(r => r.Id));
 
         var settings = new AppSettings(
             OrganizationUri: orgUri,
             ProjectName: string.IsNullOrWhiteSpace(ProjectName) ? null : ProjectName.Trim(),
             PersonalAccessToken: string.IsNullOrWhiteSpace(PersonalAccessToken) ? null : PersonalAccessToken,
-            SelectedRepositoryIds: selected);
+            SelectedRepositoryIds: selected.ToList());
 
         await _settingsService.SaveAsync(settings, CancellationToken.None);
         StatusText = "Settings saved.";
@@ -143,23 +148,51 @@ public sealed partial class MainViewModel : ObservableObject
 
         try
         {
-            var repos = await _changeProvider.GetRepositoriesAsync(orgUri, ProjectName.Trim(), PersonalAccessToken, cancellationToken);
-
             var existingSelected = preselectFromSettings
-                ? (await _settingsService.GetAsync(cancellationToken)).SelectedRepositoryIds
-                : Repositories.Where(r => r.IsSelected).Select(r => r.Id).ToArray();
+                ? (await _settingsService.GetAsync(cancellationToken)).SelectedRepositoryIds.ToHashSet(StringComparer.OrdinalIgnoreCase)
+                : Repositories.Where(r => r.IsSelected).Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            existingSelected.UnionWith(_removedSelectedRepositoryIds);
+            existingSelected.UnionWith(_preservedSelectedRepositories.Values.Where(r => r.IsSelected).Select(r => r.Id));
+
+            foreach (var repository in Repositories)
+            {
+                if (repository.IsSelected || _preservedSelectedRepositories.ContainsKey(repository.Id))
+                {
+                    _preservedSelectedRepositories[repository.Id] = repository;
+                }
+            }
+
+            var repos = await _changeProvider.GetRepositoriesAsync(orgUri, ProjectName.Trim(), PersonalAccessToken, cancellationToken);
+            var fetchedRepositoryIds = repos.Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             Repositories.Clear();
-            foreach (var repo in repos)
+
+            foreach (var repo in repos.OrderBy(r => r.Name))
             {
                 var vm = new RepoSelectionItemViewModel(repo)
                 {
-                    IsSelected = existingSelected.Contains(repo.Id, StringComparer.OrdinalIgnoreCase),
+                    IsSelected = existingSelected.Contains(repo.Id),
                 };
+
                 Repositories.Add(vm);
+                _preservedSelectedRepositories[repo.Id] = vm;
             }
 
-            StatusText = $"Loaded {Repositories.Count} repositories.";
+            var missingSelectedRepositories = _preservedSelectedRepositories.Values
+                .Where(r => existingSelected.Contains(r.Id))
+                .Where(r => !fetchedRepositoryIds.Contains(r.Id))
+                .OrderBy(r => r.Name)
+                .ToList();
+
+            foreach (var repository in missingSelectedRepositories)
+            {
+                repository.IsSelected = true;
+                Repositories.Add(repository);
+            }
+
+            _removedSelectedRepositoryIds.Clear();
+            StatusText = $"Loaded {repos.Count} repositories.";
             RebuildTabsFromSelection();
         }
         catch (Exception ex)
@@ -176,8 +209,8 @@ public sealed partial class MainViewModel : ObservableObject
     [RelayCommand]
     private async Task RefreshAsync()
     {
-        var selectedRepoIds = Repositories.Where(r => r.IsSelected).Select(r => r.Id).ToList();
-        if (selectedRepoIds.Count == 0)
+        var selectedRepositories = Repositories.Where(r => r.IsSelected).Select(r => r.Repository).ToList();
+        if (selectedRepositories.Count == 0)
         {
             StatusText = "Select at least one repository.";
             return;
@@ -193,7 +226,7 @@ public sealed partial class MainViewModel : ObservableObject
             var query = new ChangeSummaryQuery(
                 From: from,
                 To: to,
-                RepositoryIds: selectedRepoIds,
+                Repositories: selectedRepositories,
                 AuthorFilter: string.IsNullOrWhiteSpace(AuthorFilter) ? null : AuthorFilter.Trim(),
                 SearchText: string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim());
 
@@ -213,6 +246,27 @@ public sealed partial class MainViewModel : ObservableObject
         {
             IsBusy = false;
         }
+    }
+
+    [RelayCommand]
+    private void RemoveSelectedRepositories()
+    {
+        var selectedRepositories = Repositories.Where(r => r.IsSelected).ToList();
+        if (selectedRepositories.Count == 0)
+        {
+            StatusText = "No selected repositories to remove.";
+            return;
+        }
+
+        foreach (var repository in selectedRepositories)
+        {
+            _removedSelectedRepositoryIds.Add(repository.Id);
+            _preservedSelectedRepositories[repository.Id] = repository;
+            Repositories.Remove(repository);
+        }
+
+        RebuildTabsFromSelection();
+        StatusText = $"Removed {selectedRepositories.Count} selected repositories.";
     }
 
     [RelayCommand]
@@ -239,6 +293,29 @@ public sealed partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to toggle read state");
+        }
+    }
+
+    [RelayCommand]
+    private void OpenWebUrl(SummaryItemViewModel item)
+    {
+        if (item?.WebUrl is null)
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = item.WebUrl.ToString(),
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to open web URL");
+            StatusText = "Failed to open browser.";
         }
     }
 

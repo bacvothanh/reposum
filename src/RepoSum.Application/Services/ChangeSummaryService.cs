@@ -16,32 +16,16 @@ public sealed class ChangeSummaryService(
     {
         var settings = await settingsService.GetAsync(cancellationToken);
 
-        if (settings.OrganizationUri is null || string.IsNullOrWhiteSpace(settings.ProjectName) || string.IsNullOrWhiteSpace(settings.PersonalAccessToken))
+        if (string.IsNullOrWhiteSpace(settings.PersonalAccessToken))
         {
             return Array.Empty<SummaryItemDto>();
         }
 
-        var repoIds = query.RepositoryIds.Count > 0
-            ? query.RepositoryIds
-            : settings.SelectedRepositoryIds;
-
-        if (repoIds.Count == 0)
+        var selectedRepos = query.Repositories;
+        if (selectedRepos.Count == 0)
         {
             return Array.Empty<SummaryItemDto>();
         }
-
-        var repositories = await changeProvider.GetRepositoriesAsync(
-            settings.OrganizationUri,
-            settings.ProjectName!,
-            settings.PersonalAccessToken!,
-            cancellationToken);
-
-        var repoById = repositories.ToDictionary(r => r.Id, StringComparer.OrdinalIgnoreCase);
-
-        var selectedRepos = repoIds
-            .Where(id => repoById.ContainsKey(id))
-            .Select(id => repoById[id])
-            .ToList();
 
         var allItems = new List<SummaryItem>();
 

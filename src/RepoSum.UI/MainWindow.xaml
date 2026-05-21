@@ -27,6 +27,7 @@
 
                         <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
                             <Button Content="Load Repos" Command="{Binding LoadRepositoriesCommand}" Margin="0,0,8,0" />
+                            <Button Content="Remove Selected" Command="{Binding RemoveSelectedRepositoriesCommand}" Margin="0,0,8,0" />
                             <Button Content="Save" Command="{Binding SaveSettingsCommand}" />
                         </StackPanel>
                     </StackPanel>
@@ -105,11 +106,16 @@
                                         <StackPanel>
                                             <DockPanel>
                                                 <TextBlock DockPanel.Dock="Left" FontWeight="SemiBold" Text="{Binding Title}" />
-                                                <Button DockPanel.Dock="Right"
-                                                        Margin="8,0,0,0"
-                                                        Content="{Binding IsRead, Converter={x:Static local:BooleanToReadLabelConverter.Instance}}"
-                                                        Command="{Binding DataContext.ToggleReadCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                        CommandParameter="{Binding}" />
+                                                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                                    <Button Content="🔗 Open"
+                                                            ToolTip="Open in browser"
+                                                            Command="{Binding DataContext.OpenWebUrlCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                            CommandParameter="{Binding}"
+                                                            Margin="0,0,8,0" />
+                                                    <Button Content="{Binding IsRead, Converter={x:Static local:BooleanToReadLabelConverter.Instance}}"
+                                                            Command="{Binding DataContext.ToggleReadCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                            CommandParameter="{Binding}" />
+                                                </StackPanel>
                                             </DockPanel>
 
                                             <TextBlock Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" FontSize="12" Margin="0,2,0,0">
