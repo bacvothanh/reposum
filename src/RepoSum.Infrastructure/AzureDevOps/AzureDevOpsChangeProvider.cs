@@ -34,12 +34,7 @@ public sealed class AzureDevOpsChangeProvider(
         string personalAccessToken,
         CancellationToken cancellationToken)
     {
-        var key = $"azdo:repos:{organizationUri}:{projectName}";
-        return cache.GetOrCreateAsync(
-            key,
-            ttl: TimeSpan.FromMinutes(10),
-            factory: ct => GetRepositoriesUncachedAsync(organizationUri, projectName, personalAccessToken, ct),
-            cancellationToken);
+        return GetRepositoriesUncachedAsync(organizationUri, projectName, personalAccessToken, cancellationToken);
     }
 
     public Task<ChangeSet> GetChangesAsync(

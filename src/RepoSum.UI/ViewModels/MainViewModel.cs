@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Diagnostics;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -18,6 +20,7 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly ILogger<MainViewModel> _logger;
     private readonly HashSet<string> _removedSelectedRepositoryIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, RepoSelectionItemViewModel> _preservedSelectedRepositories = new(StringComparer.OrdinalIgnoreCase);
+    private bool _isPersistingSelection;
 
     public MainViewModel(
         ISettingsService settingsService,
@@ -32,15 +35,16 @@ public sealed partial class MainViewModel : ObservableObject
         _readStateStore = readStateStore;
         _logger = logger;
 
-        DateRangePresets = new[]
-        {
+        Repositories.CollectionChanged += Repositories_CollectionChanged;
+
+        DateRangePresets =
+        [
             DateRangePreset.Last24Hours,
             DateRangePreset.Last7Days,
             DateRangePreset.Last30Days,
-        };
+        ];
 
         SelectedDateRangePreset = DateRangePreset.Last7Days;
-
         Tabs.Add(new DashboardTabViewModel("All", repositoryId: null));
 
         _ = InitializeAsync();
@@ -97,25 +101,7 @@ public sealed partial class MainViewModel : ObservableObject
     [RelayCommand]
     private async Task SaveSettingsAsync()
     {
-        if (!TryBuildOrganizationUri(out var orgUri))
-        {
-            StatusText = "Invalid Organization URL.";
-            return;
-        }
-
-        var selected = Repositories.Where(r => r.IsSelected).Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        selected.UnionWith(_removedSelectedRepositoryIds);
-        selected.UnionWith(_preservedSelectedRepositories.Values.Where(r => r.IsSelected).Select(r => r.Id));
-
-        var settings = new AppSettings(
-            OrganizationUri: orgUri,
-            ProjectName: string.IsNullOrWhiteSpace(ProjectName) ? null : ProjectName.Trim(),
-            PersonalAccessToken: string.IsNullOrWhiteSpace(PersonalAccessToken) ? null : PersonalAccessToken,
-            SelectedRepositoryIds: selected.ToList());
-
-        await _settingsService.SaveAsync(settings, CancellationToken.None);
-        StatusText = "Settings saved.";
-
+        await PersistSettingsAsync("Settings saved.");
         RebuildTabsFromSelection();
     }
 
@@ -148,12 +134,25 @@ public sealed partial class MainViewModel : ObservableObject
 
         try
         {
+            var settings = await _settingsService.GetAsync(cancellationToken);
             var existingSelected = preselectFromSettings
-                ? (await _settingsService.GetAsync(cancellationToken)).SelectedRepositoryIds.ToHashSet(StringComparer.OrdinalIgnoreCase)
+                ? settings.SelectedRepositoryIds.ToHashSet(StringComparer.OrdinalIgnoreCase)
                 : Repositories.Where(r => r.IsSelected).Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             existingSelected.UnionWith(_removedSelectedRepositoryIds);
             existingSelected.UnionWith(_preservedSelectedRepositories.Values.Where(r => r.IsSelected).Select(r => r.Id));
+
+            foreach (var persistedRepository in settings.SelectedRepositories)
+            {
+                var repository = persistedRepository.ToRepositoryRef();
+                if (!_preservedSelectedRepositories.ContainsKey(repository.Id))
+                {
+                    _preservedSelectedRepositories[repository.Id] = new RepoSelectionItemViewModel(repository)
+                    {
+                        IsSelected = existingSelected.Contains(repository.Id),
+                    };
+                }
+            }
 
             foreach (var repository in Repositories)
             {
@@ -182,7 +181,8 @@ public sealed partial class MainViewModel : ObservableObject
             var missingSelectedRepositories = _preservedSelectedRepositories.Values
                 .Where(r => existingSelected.Contains(r.Id))
                 .Where(r => !fetchedRepositoryIds.Contains(r.Id))
-                .OrderBy(r => r.Name)
+                .OrderBy(r => r.Repository.ProjectName)
+                .ThenBy(r => r.Name)
                 .ToList();
 
             foreach (var repository in missingSelectedRepositories)
@@ -192,7 +192,7 @@ public sealed partial class MainViewModel : ObservableObject
             }
 
             _removedSelectedRepositoryIds.Clear();
-            StatusText = $"Loaded {repos.Count} repositories.";
+            StatusText = $"Loaded {Repositories.Count} repositories.";
             RebuildTabsFromSelection();
         }
         catch (Exception ex)
@@ -234,7 +234,6 @@ public sealed partial class MainViewModel : ObservableObject
             var items = dtos.Select(d => new SummaryItemViewModel(d)).ToList();
 
             PopulateTabs(items);
-
             StatusText = $"{items.Count} items.";
         }
         catch (Exception ex)
@@ -267,6 +266,7 @@ public sealed partial class MainViewModel : ObservableObject
 
         RebuildTabsFromSelection();
         StatusText = $"Removed {selectedRepositories.Count} selected repositories.";
+        _ = PersistSettingsAsync();
     }
 
     [RelayCommand]
@@ -309,7 +309,7 @@ public sealed partial class MainViewModel : ObservableObject
             Process.Start(new ProcessStartInfo
             {
                 FileName = item.WebUrl.ToString(),
-                UseShellExecute = true
+                UseShellExecute = true,
             });
         }
         catch (Exception ex)
@@ -321,10 +321,15 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void RebuildTabsFromSelection()
     {
-        var selected = Repositories.Where(r => r.IsSelected).Select(r => r.Repository).ToList();
+        var selected = Repositories
+            .Where(r => r.IsSelected)
+            .Select(r => r.Repository)
+            .DistinctBy(r => r.Id)
+            .ToList();
 
         Tabs.Clear();
         Tabs.Add(new DashboardTabViewModel("All", repositoryId: null));
+
         foreach (var repo in selected.OrderBy(r => r.Name))
         {
             Tabs.Add(new DashboardTabViewModel(repo.Name, repo.Id));
@@ -387,5 +392,84 @@ public sealed partial class MainViewModel : ObservableObject
 
         organizationUri = uri;
         return true;
+    }
+
+    private void Repositories_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.OldItems is not null)
+        {
+            foreach (RepoSelectionItemViewModel repository in e.OldItems)
+            {
+                repository.PropertyChanged -= Repository_PropertyChanged;
+            }
+        }
+
+        if (e.NewItems is not null)
+        {
+            foreach (RepoSelectionItemViewModel repository in e.NewItems)
+            {
+                repository.PropertyChanged += Repository_PropertyChanged;
+            }
+        }
+    }
+
+    private async Task PersistSettingsAsync(string? successStatusText = null)
+    {
+        if (_isPersistingSelection)
+        {
+            return;
+        }
+
+        if (!TryBuildOrganizationUri(out var orgUri))
+        {
+            return;
+        }
+
+        _isPersistingSelection = true;
+        try
+        {
+            var selected = Repositories.Where(r => r.IsSelected).Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            selected.UnionWith(_removedSelectedRepositoryIds);
+            selected.UnionWith(_preservedSelectedRepositories.Values.Where(r => r.IsSelected).Select(r => r.Id));
+
+            var selectedRepositories = Repositories.Where(r => r.IsSelected).Select(r => r.Repository)
+                .Concat(_preservedSelectedRepositories.Values.Where(r => selected.Contains(r.Id)).Select(r => r.Repository))
+                .DistinctBy(r => r.Id)
+                .Select(PersistedRepository.FromRepositoryRef)
+                .ToList();
+
+            var settings = new AppSettings(
+                OrganizationUri: orgUri,
+                ProjectName: string.IsNullOrWhiteSpace(ProjectName) ? null : ProjectName.Trim(),
+                PersonalAccessToken: string.IsNullOrWhiteSpace(PersonalAccessToken) ? null : PersonalAccessToken,
+                SelectedRepositoryIds: selected.ToList(),
+                SelectedRepositories: selectedRepositories);
+
+            await _settingsService.SaveAsync(settings, CancellationToken.None);
+
+            if (!string.IsNullOrWhiteSpace(successStatusText))
+            {
+                StatusText = successStatusText;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to persist settings");
+        }
+        finally
+        {
+            _isPersistingSelection = false;
+        }
+    }
+
+    private void Repository_PropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (!string.Equals(e.PropertyName, nameof(RepoSelectionItemViewModel.IsSelected), StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        RebuildTabsFromSelection();
+        _ = PersistSettingsAsync();
     }
 }
